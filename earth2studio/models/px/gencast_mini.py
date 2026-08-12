@@ -588,9 +588,9 @@ class GenCastMini(torch.nn.Module, AutoModelMixin, PrognosticMixin):
         xr.Dataset
             Prediction for each 12-hour time step
         """
-        inputs = xr.Dataset(inputs)
-        targets_template = xr.Dataset(targets_template)
-        forcings = xr.Dataset(forcings)
+        inputs = inputs.copy()
+        targets_template = targets_template.copy()
+        forcings = forcings.copy()
 
         targets_chunk_time = targets_template.time.isel(time=slice(0, 1))
         current_inputs = inputs
