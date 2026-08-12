@@ -38,7 +38,6 @@ try:
     from aurora import AuroraV1p5Ensemble as Aurora1p5Ensemble_model
     from aurora import Batch, Metadata
     from aurora.insolation import insolation as aurora_insolation
-    from aurora.normalisation import log_untransform as aurora_log_untransform
 except ImportError:
     OptionalDependencyFailure("aurora")
     Aurora1p5_model = None
@@ -46,7 +45,6 @@ except ImportError:
     Batch = None
     Metadata = None
     aurora_insolation = None
-    aurora_log_untransform = None
 
 ATMOS_LEVELS = [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50]
 
@@ -118,15 +116,23 @@ _SURF_VAR_MAP = {
 _SURF_VARS_E2S = list(_SURF_VAR_MAP.keys())
 
 # Output-only surface variables: produced by the decoder but not fed back as AR
-# inputs. Mapping is (E2S name, Aurora name, needs_log_untransform).
+# inputs. Mapping is (E2S name, Aurora name).
+#
+# The `scaled_` prefix marks variables Aurora carries in log space internally,
+# but `Aurora.forward` already inverts that in its `_post_unnorm_hook` (which
+# runs `log_untransform` over every `scaled_*` surf var right before returning),
+# so the values reaching us are ALREADY in physical units. Applying
+# `log_untransform` again here made tp/sf ~1000x too small: for small physical x,
+# `1e-3 * (exp(x) - 1) ~= 1e-3 * x`. Note the input-side `sd` (-> `scaled_sd`)
+# is likewise taken as-is below, which is the consistent treatment.
 _OUTPUT_ONLY_SURF_VARS = [
-    ("i10fg", "i10fg", False),
-    ("blh", "blh", False),
-    ("uvb1h", "uvb_1h", False),
-    ("ssrd1h", "ssrd_1h", False),
-    ("ttr1h", "ttr_1h", False),
-    ("tp1h", "scaled_tp_1h", True),
-    ("sf1h", "scaled_sf_1h", True),
+    ("i10fg", "i10fg"),
+    ("blh", "blh"),
+    ("uvb1h", "uvb_1h"),
+    ("ssrd1h", "ssrd_1h"),
+    ("ttr1h", "ttr_1h"),
+    ("tp1h", "scaled_tp_1h"),
+    ("sf1h", "scaled_sf_1h"),
 ]
 
 _N_ATMOS_LEVELS = len(ATMOS_LEVELS)
@@ -438,14 +444,13 @@ class Aurora1p5(torch.nn.Module, AutoModelMixin, PrognosticMixin):
             dim=2,
         )  # (B, 1, 18, H, W)
 
-        # Output-only diagnostic vars. scaled_tp_1h / scaled_sf_1h are stored
-        # in log-space by Aurora's post-norm hook; invert to physical units.
-        diag_tensors = []
-        for _, aurora_name, log_scaled in _OUTPUT_ONLY_SURF_VARS:
-            v = output.surf_vars[aurora_name]
-            if log_scaled:
-                v = aurora_log_untransform(v)
-            diag_tensors.append(v.unsqueeze(2))
+        # Output-only diagnostic vars. Already in physical units -- Aurora's
+        # own _post_unnorm_hook inverted the log transform (see the note on
+        # _OUTPUT_ONLY_SURF_VARS); do not untransform again.
+        diag_tensors = [
+            output.surf_vars[aurora_name].unsqueeze(2)
+            for _, aurora_name in _OUTPUT_ONLY_SURF_VARS
+        ]
         diag = torch.cat(diag_tensors, dim=2)  # (B, 1, 7, H, W)
 
         x = torch.cat([atmos, surf, diag], dim=2)  # (B, 1, 90, H, W)
