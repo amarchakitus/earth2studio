@@ -371,9 +371,9 @@ class GraphCastOperational(torch.nn.Module, AutoModelMixin, PrognosticMixin):
         """
 
         # Create copies to avoid mutating inputs.
-        inputs = xr.Dataset(inputs)
-        targets_template = xr.Dataset(targets_template)
-        forcings = xr.Dataset(forcings)
+        inputs = inputs.copy()
+        targets_template = targets_template.copy()
+        forcings = forcings.copy()
 
         # Our template targets will always have a time axis corresponding for the
         # timedeltas for the first chunk.
@@ -565,7 +565,13 @@ class GraphCastOperational(torch.nn.Module, AutoModelMixin, PrognosticMixin):
         if "ensemble" in dataset.dims:
             dataset = dataset.squeeze("batch", drop=True)
 
-        dataset = dataset.rename({key: INV_VOCAB[key] for key in dataset.data_vars})
+        # GraphCast's native precip variable is `total_precipitation_6hr`, but the
+        # ARCO lexicon (INV_VOCAB) keys it as `total_precipitation::`. Translate it
+        # back before the lookup so it maps to `tp06`.
+        _gc_to_arco = {"total_precipitation_6hr::": "total_precipitation::"}
+        dataset = dataset.rename(
+            {key: INV_VOCAB[_gc_to_arco.get(key, key)] for key in dataset.data_vars}
+        )
 
         if "batch" in dataset.dims:
             dataarray = (
