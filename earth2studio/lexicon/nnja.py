@@ -46,6 +46,7 @@ _SOURCE_KEYS = {
     "t": "prepbufr::TOB",
     "pres": "prepbufr::POB",
     "gps": "gpsro::15037",
+    "gps_refractivity": "gpsro::15036",
 }
 
 
@@ -117,6 +118,9 @@ class NNJAObsConvLexicon(metaclass=LexiconType):
         occurs once per frequency in each occultation. The source emits
         only the ionosphere-corrected (frequency-combined, MEFR == 0)
         observation instance during decode.
+      - ``15036`` -- refractivity (N-units) at the message's geometric
+        height levels (``HEIT``), exposed as ``gps_refractivity``; only the
+        value slot is emitted, not its error.
 
       The same source file can contain provider 1D-Var retrieval profiles:
       pressure (``10004``), temperature (``12001``), and specific humidity
@@ -155,6 +159,8 @@ class NNJAObsConvLexicon(metaclass=LexiconType):
         "pres": "prepbufr::POB",
         # GPS RO ionosphere-corrected bending angle from gps/gpsro/.
         "gps": "gpsro::15037",
+        # GPS RO refractivity levels (N-units) at HEIT heights.
+        "gps_refractivity": "gpsro::15036",
     }
 
     @classmethod
@@ -177,12 +183,60 @@ class NNJAObsConvLexicon(metaclass=LexiconType):
         return get_ncep_conventional_item(val, route_prefix=True)
 
 
+class NNJAObsSatwndLexicon(metaclass=LexiconType):
+    """NNJA lexicon for the raw NCEP ``satwnd`` atmospheric-motion-vector dump.
+
+    ``u``/``v`` are decomposed from the dump's ``WDIR``/``WSPD`` (m s-1, no unit
+    conversion). Both components share one AMV row set; the ``SDMEDIT`` wind
+    quality mark is in ``quality`` and producer metadata (satellite, subset,
+    computation method, zenith angle, quality indicators) in the extra
+    ``NNJAObsSatwnd`` columns.
+
+    Note
+    ----
+    Additional resources:
+
+    - https://psl.noaa.gov/data/nnja_obs/
+    """
+
+    VOCAB: dict[str, str] = {
+        "u": "satwnd::u",
+        "v": "satwnd::v",
+    }
+
+    @classmethod
+    def get_item(cls, val: str) -> tuple[str, Callable[[pd.DataFrame], pd.DataFrame]]:
+        """Get item from the NNJA SATWND vocabulary.
+
+        Parameters
+        ----------
+        val : str
+            Variable id (``"u"`` or ``"v"``).
+
+        Returns
+        -------
+        tuple[str, Callable]
+            Route-prefixed source key and an identity modifier.
+        """
+
+        def modifier(frame: pd.DataFrame) -> pd.DataFrame:
+            return frame
+
+        return cls.VOCAB[val], modifier
+
+
 class NNJAObsSatLexicon(metaclass=LexiconType):
-    """NNJA aggregate microwave observation lexicon.
+    """NNJA aggregate satellite observation lexicon.
 
     ``atms`` selects encoded ``TMBR`` scene brightness temperature, while
     ``atms_antenna_temperature`` selects encoded ``TMANT`` antenna temperature.
     The legacy sounder names select their encoded ``TMBR`` fields unchanged.
+
+    The hyperspectral IR sounder names select every published channel of the
+    sensor, returned as brightness temperature in Kelvin: ``airs`` is encoded
+    as ``TMBR`` directly, while ``iasi`` (scaled radiance ``SCRA``) and
+    ``cris`` (float radiance ``SRAD``) are converted via Planck inversion
+    during decode.
 
     Note
     ----
@@ -196,6 +250,9 @@ class NNJAObsSatLexicon(metaclass=LexiconType):
         "mhs": "mhs::TMBR",
         "amsua": "amsua::TMBR",
         "amsub": "amsub::TMBR",
+        "airs": "airs::TMBR",
+        "iasi": "iasi::SCRA",
+        "cris": "cris::SRAD",
     }
 
     @classmethod

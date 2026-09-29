@@ -44,22 +44,29 @@ from earth2studio.data.utils import (
     obstore_fetch_to_cache,
     prep_data_inputs,
 )
-from earth2studio.data.utils_bufr import BUFR_DEPENDENCY_KEY
+from earth2studio.data.utils_bufr import BUFR_DEPENDENCY_KEY, PREPBUFR_OBS_TYPES
 from earth2studio.data.utils_ncep import (
     NCEP_CONVENTIONAL_PUBLIC_SCHEMA,
     NCEP_MICROWAVE_OUTPUT_SCHEMA,
     NCEP_MICROWAVE_SATELLITES,
+    NCEP_SATWND_PUBLIC_SCHEMA,
     NCEPObsTask,
     compile_dataframe,
     cycle_windows,
     decode_gpsro,
+    decode_ir_sounder,
     decode_microwave,
     decode_prepbufr,
+    decode_satwnd,
     map_aircraft_profile_types,
     plan_conv_tasks,
     resolve_output_schema,
 )
-from earth2studio.lexicon import NNJAObsConvLexicon, NNJAObsSatLexicon
+from earth2studio.lexicon import (
+    NNJAObsConvLexicon,
+    NNJAObsSatLexicon,
+    NNJAObsSatwndLexicon,
+)
 from earth2studio.utils.imports import check_optional_dependencies
 from earth2studio.utils.time import normalize_time_tolerance
 from earth2studio.utils.type import TimeArray, TimeTolerance, VariableArray
@@ -73,6 +80,11 @@ class _NNJASatProduct:
     prefix: str
     filename: str
     first_year: int
+    last_year: int | None = None
+    # Cycle-file naming convention within <prefix>/YYYY/MM/bufr/:
+    #   "gdas": gdas.YYYYMMDD.tHHz.<filename>.tm00.bufr_d (NCEP dumps)
+    #   "nasa": <filename>.YYYYMMDD.tHHz.bufr (NASA GES DISC final products)
+    naming: str = "gdas"
 
 
 class _NNJAObsSatIncompleteError(RuntimeError):
@@ -86,6 +98,44 @@ _NNJA_SAT_PRODUCTS: dict[str, _NNJASatProduct] = {
     "mhs": _NNJASatProduct("mhs/1bmhs", "1bmhs", 2005),
     "amsua": _NNJASatProduct("amsua/1bamua", "1bamua", 1998),
     "amsub": _NNJASatProduct("amsub/1bamub", "1bamub", 1998),
+    # IR sounder archive coverage verified against the live bucket listings;
+    # the archives start later than the instruments' launch years. AIRS routes
+    # to airs/nasa/aqua (2002-08-31 → 2023-01-18) rather than airs/airsev
+    # (2007-02-21 → 2020-12-07); the two are structurally identical BUFR files
+    # and agree on the infrared values, but the NASA route spans five more
+    # early years and the instrument's final two. The routed CrIS product is
+    # crisf4, the full-spectral-resolution dump whose channel numbers live on
+    # the 2211-channel FSR grid that the conversion in utils_ir assumes; the
+    # older cris/cris archive (2012-2020) is NSR with different channel
+    # numbering and is deliberately not routed.
+    "airs": _NNJASatProduct(
+        "airs/nasa/aqua", "airs_disc_final", 2002, last_year=2023, naming="nasa"
+    ),
+    "iasi": _NNJASatProduct("iasi/mtiasi", "mtiasi", 2008),
+    "cris": _NNJASatProduct("cris/crisf4", "crisf4", 2018),
+}
+
+# Hyperspectral IR sounders share the aggregate cycle-file layout above but
+# decode through decode_ir_sounder rather than decode_microwave
+_NNJA_IR_SENSORS = frozenset({"airs", "iasi", "cris"})
+
+# Valid platforms per IR sensor; every entry is also a member of
+# NCEP_MICROWAVE_SATELLITES, so VALID_SATELLITES needs no extension
+_NNJA_IR_SATELLITES: dict[str, frozenset[str]] = {
+    "airs": frozenset({"aqua"}),
+    "iasi": frozenset({"metop-a", "metop-b", "metop-c"}),
+    "cris": frozenset({"npp", "n20", "n21"}),
+}
+
+# Instrument-grid channel-number bounds per IR sensor, for validating
+# sensor_indices at construction. The archives carry NCEP subsets (281 AIRS,
+# 616 IASI, 431 CrIS channels) whose membership varies by product era, so
+# only the instrument grid can be checked statically; a valid-but-unarchived
+# channel simply matches no rows at decode time.
+_NNJA_IR_CHANNEL_MAX: dict[str, int] = {
+    "airs": 2378,  # AIRS instrument grid
+    "iasi": 8461,  # IASI L1C grid, 645-2760 cm⁻¹
+    "cris": 2211,  # CrIS FSR sensor_chan grid
 }
 
 
@@ -112,7 +162,14 @@ class NNJAObsConv:
     GPSRO rows use the shared columns with product-specific meanings:
     ``type`` is receiver ``SAID``, ``station`` combines receiver/transmitter
     identifiers, ``quality`` is the QFRO flag table, ``pres`` is null, and
-    ``elev`` is impact parameter minus Earth radius of curvature.
+    ``elev`` is impact parameter minus Earth radius of curvature for ``gps``
+    rows. The ``gps_refractivity`` variable exposes the message's refractivity
+    levels (``ARFR``, N-units) with ``elev`` set to the level height (``HEIT``)
+    so consumers can derive their own vertical coordinate. Both carry the
+    occultation's ``radius_curvature`` (``ELRC``) and ``geoid_undulation``
+    (``GEODU``); a level without its own tangent point sits at the
+    occultation's reference point. No retrieval
+    product is read.
 
     Parameters
     ----------
@@ -155,6 +212,10 @@ class NNJAObsConv:
     retries : int, optional
         Number of retry attempts per failed fetch task with exponential
         backoff, by default 3.
+    exclude_message_types : Sequence[str], optional
+        PrepBUFR message families to skip at decode, e.g. ``("SATWND",)`` when
+        atmospheric motion vectors come from :class:`NNJAObsSatwnd` instead. By
+        default every family is decoded.
 
     Warning
     -------
@@ -193,6 +254,7 @@ class NNJAObsConv:
         async_workers: int = 24,
         decode_workers: int = 8,
         retries: int = 3,
+        exclude_message_types: Sequence[str] = (),
     ) -> None:
         if source == "convbufr":
             raise NotImplementedError(
@@ -206,6 +268,13 @@ class NNJAObsConv:
             raise ValueError(
                 f"Invalid source '{source}'. Valid sources: {sorted(self.VALID_SOURCES)}"
             )
+        unknown = set(exclude_message_types) - set(PREPBUFR_OBS_TYPES.values())
+        if unknown:
+            raise ValueError(
+                f"Unknown PrepBUFR message types {sorted(unknown)}; valid: "
+                f"{sorted(PREPBUFR_OBS_TYPES.values())}"
+            )
+        self._exclude_message_types = frozenset(exclude_message_types)
         self._source = source
         # Internal switch for the special aircraft-profile product. Default
         # output maps profile-stage 33x/43x/53x report codes to the standard
@@ -297,6 +366,8 @@ class NNJAObsConv:
                 key,
                 self.cache,
                 cache_key=hashlib.sha256(path.encode()).hexdigest(),
+                chunked=True,
+                atomic=True,
             )
         except FileNotFoundError:
             self._handle_missing_file(path)
@@ -379,6 +450,7 @@ class NNJAObsConv:
                 task.datetime_min,
                 task.datetime_max,
                 decode_workers=self._decode_workers,
+                exclude_message_types=self._exclude_message_types,
             )
             if (
                 self._source == "prepbufr.acft_profiles"
@@ -427,13 +499,143 @@ class NNJAObsConv:
 
 
 @check_optional_dependencies(BUFR_DEPENDENCY_KEY)
-class NNJAObsSat:
-    """NNJA historical NCEP aggregate microwave satellite observations.
+class NNJAObsSatwnd(NNJAObsConv):
+    """NNJA satellite-derived atmospheric motion vector (SATWND) data source.
 
-    This source reads the NCEP satellite ATMS, MHS, AMSU-A, and AMSU-B
-    BUFR products from the NNJA archive. It returns one long-format row per
+    Reads the raw NCEP AMV dumps (``amv/`` in the NNJA archive) rather than the
+    AMVs merged into PrepBUFR. The dumps keep every producer stream (GOES legacy
+    and GOES-R, Meteosat, Himawari, MODIS, AVHRR, VIIRS, LEO-GEO, INSAT) with its
+    own computation method, height assignment and quality indicators. Cycles
+    through 2019 read the ``amv/merged`` reprocessed product and later cycles the
+    operational ``amv/satwnd`` dump.
+
+    ``u``/``v`` rows are decomposed from ``WDIR``/``WSPD``. Shared columns follow
+    :class:`NNJAObsConv`: ``pres`` is the height assignment (``PRLC``, Pa),
+    ``quality`` the ``SWQM`` wind quality mark where the producer encodes one,
+    ``class`` is ``"SATWND"``; ``type``, ``station`` and ``elev`` are null
+    since the dump carries no report type, station or geometric height. Extra
+    columns carry ``satellite_id``, ``subset``, ``wind_method`` (``SWCM``),
+    ``wind_method_local`` (``CMCM``), ``height_method``, ``satellite_za`` and
+    the raw quality indicators keyed by generating application. No report
+    typing, quality control or thinning is applied.
+
+    Parameters
+    ----------
+    time_tolerance : TimeTolerance, optional
+        Time tolerance window for filtering observations. Accepts a single
+        value (symmetric ± window) or a tuple ``(lower, upper)`` for
+        asymmetric windows, by default ``np.timedelta64(0, 'm')``.
+    cache : bool, optional
+        Cache downloaded files in the local filesystem cache, by default True.
+    verbose : bool, optional
+        Show progress bars, by default True.
+    async_timeout : int, optional
+        Total timeout in seconds for the async fetch, by default 600.
+    async_workers : int, optional
+        Maximum number of concurrent async fetch tasks, by default 24.
+    decode_workers : int, optional
+        Number of parallel processes for BUFR message decoding. Recent cycle
+        files hold 3-5 million winds and decode at roughly 1,500 winds per second
+        per worker, so decoding dominates run time and scales with workers.
+        Set to 1 to disable multiprocessing, by default 8.
+    retries : int, optional
+        Number of retry attempts per failed fetch task with exponential
+        backoff, by default 3.
+
+    Warning
+    -------
+    This is a remote data source and can potentially download a large amount of data
+    to your local machine for large requests.
+
+    Note
+    ----
+    Additional information on the data repository can be referenced here:
+
+    - https://psl.noaa.gov/data/nnja_obs/
+    - https://registry.opendata.aws/noaa-reanalyses-pds/
+
+    Badges
+    ------
+    region:global dataclass:observation product:wind product:sat
+    """
+
+    SOURCE_ID = "earth2studio.data.NNJAObsSatwnd"
+    SCHEMA = NCEP_SATWND_PUBLIC_SCHEMA
+    LEXICON = NNJAObsSatwndLexicon  # type: ignore[assignment]
+    MIN_DATE = datetime(1979, 1, 1)
+    # Last year of the reprocessed amv/merged product; the operational dump follows.
+    MERGED_LAST_YEAR = 2019
+    VALID_SOURCES = frozenset(["satwnd"])
+
+    def __init__(
+        self,
+        time_tolerance: TimeTolerance = np.timedelta64(0, "m"),
+        cache: bool = True,
+        verbose: bool = True,
+        async_timeout: int = 600,
+        async_workers: int = 24,
+        decode_workers: int = 8,
+        retries: int = 3,
+    ) -> None:
+        super().__init__(
+            source="satwnd",
+            time_tolerance=time_tolerance,
+            cache=cache,
+            verbose=verbose,
+            async_timeout=async_timeout,
+            async_workers=async_workers,
+            decode_workers=decode_workers,
+            retries=retries,
+        )
+
+    def _build_uri(self, route: str, cycle: datetime) -> str:
+        if route != "satwnd":
+            raise ValueError(f"Unsupported route '{route}'")
+        product = "merged" if cycle.year <= self.MERGED_LAST_YEAR else "satwnd"
+        return (
+            f"s3://{NNJA_BUCKET}/{NNJA_PREFIX}/amv/{product}/"
+            f"{cycle:%Y}/{cycle:%m}/bufr/"
+            f"gdas.{cycle:%Y%m%d}.t{cycle.hour:02d}z.satwnd.tm00.bufr_d"
+        )
+
+    def _decode_file(self, local_path: str, task: NCEPObsTask) -> pd.DataFrame:
+        if task.route != "satwnd":
+            raise ValueError(f"Unsupported route '{task.route}'")
+        frame = decode_satwnd(
+            local_path,
+            task.var_plan,
+            task.datetime_min,
+            task.datetime_max,
+            decode_workers=self._decode_workers,
+        )
+        return frame[self.SCHEMA.names]
+
+
+@check_optional_dependencies(BUFR_DEPENDENCY_KEY)
+class NNJAObsSat:
+    """NNJA historical NCEP aggregate satellite observations.
+
+    This source reads the NCEP satellite microwave (ATMS, MHS, AMSU-A,
+    AMSU-B) and hyperspectral infrared sounder (AIRS, IASI, CrIS) BUFR
+    products from the NNJA archive. It returns one long-format row per
     finite encoded channel value. ``sensor_index`` is the physical ``CHNM``
     channel number, not a dense index into a selected channel list.
+
+    The IR sounders are returned in brightness temperature (K) regardless of
+    how the archive stores them: AIRS is encoded as brightness temperature
+    (``TMBR``) directly, while IASI (scaled integer radiance, ``SCRA``) and
+    CrIS (float radiance, ``SRAD``) are converted via Planck inversion. The
+    ``wavenumber`` column carries the channel centre wavenumber in cm⁻¹,
+    computed from the instrument grids for IASI/CrIS and read from the
+    per-channel ``LOGRCW`` field of the aggregate for AIRS.
+    The aggregates carry the NCEP channel subsets (281 AIRS, 616 IASI, 431
+    CrIS) numbered on the instrument grids; ``cris`` routes to the
+    full-spectral-resolution ``crisf4`` product whose channel numbers live
+    on the 2211-channel FSR grid. Archive coverage: AIRS 2002–2023
+    (NASA/Aqua route), IASI 2008–present, CrIS (FSR) 2018–present. All
+    archived channels are returned by default; pass ``sensor_indices`` to
+    narrow at decode time or subset downstream via the ``sensor_index``
+    column.
 
     ``atms`` returns the encoded 22-channel ``TMBR`` scene brightness
     temperature. ``atms_antenna_temperature`` returns the corresponding
@@ -449,10 +651,23 @@ class NNJAObsSat:
     confirms that exception for AMSU-A. The platform identity is retained so a
     downstream transform can apply the appropriate convention explicitly.
 
-    ``scan_position`` preserves the encoded one-based FOV number.
-    ``scan_angle`` is the signed nominal instrument look angle derived from
-    that FOV; negative values are on the first half of the scan. The encoded
-    ``satellite_za`` remains the unsigned Earth-view zenith magnitude.
+    ``scan_position`` is the one-based cross-track position: the encoded
+    ``FOVN`` for the microwave sensors, AIRS (1-90), and IASI (1-120, a
+    composite of 30 fields of regard x 4 detectors), and the encoded
+    ``FORN`` (1-30) for CrIS, whose ``FOVN`` is the 1-9 detector index
+    within the 3x3 field of regard and is not carried. ``scan_angle`` is
+    the signed nominal instrument look angle derived from the FOV for the
+    microwave sensors; it is always NaN for the IR sounders, whose scan
+    geometry is sensor-specific — use ``satellite_za`` (the unsigned
+    Earth-view zenith magnitude) for view-angle screening.
+
+    ``elev`` (surface elevation) is populated only for CrIS, whose template
+    carries ``HOLS``; the AIRS and IASI templates carry no surface-elevation
+    field at all, so ``elev`` is null for them. (Their ``SELV`` field is the
+    platform's orbital altitude, ~700-840 km, and must not be mistaken for
+    surface elevation.) ``scan_line`` is the encoded ``SLNM``, a
+    granule-local counter that repeats within a cycle file; pair it with
+    ``time`` to address a scan.
 
     Parameters
     ----------
@@ -477,14 +692,33 @@ class NNJAObsSat:
     retries : int, optional
         Number of retry attempts per failed fetch task with exponential
         backoff, by default 3.
+    sensor_indices : dict[str, Sequence[int]] | None, optional
+        Per-sensor channel-number subsets for the IR sounders, e.g.
+        ``{"cris": [19, 24], "iasi": [16]}``. Named after the
+        ``sensor_indices`` selection of the JPSS/METOP sources and applied
+        at decode time like theirs, but keyed per sensor since this source
+        spans several instruments. Selections must be non-empty, unique
+        integers on the instrument grid (AIRS 1-2378, IASI 1-8461, CrIS FSR
+        1-2211); a channel on the grid but absent from the archived NCEP
+        subset matches no rows. Sensors absent from the dict (and all
+        microwave sensors) return every archived channel. By default None
+        (all channels).
 
     Warning
     -------
-    Aggregate cycle files contain millions of footprints. Broad long-format
-    requests can require substantial memory. A finite archived value is not a
-    QC decision: historical files may retain passive or degraded channels even
-    when the aggregate carries no usable quality flag. Training pipelines
-    should apply an explicit platform/channel validity policy.
+    Aggregate cycle files contain millions of footprints, and hyperspectral
+    IR requests return one long-format row per (footprint, channel). At all
+    channels a single 6-hour cycle is on the order of 10⁸-10⁹ rows per
+    sensor (CrIS ~940 M across its three platforms, IASI ~400 M, AIRS
+    ~210 M), which does not fit in memory on ordinary machines. All-channel
+    requests are for narrow time windows and diagnostics; use
+    ``sensor_indices`` to select a channel subset for anything larger — the
+    narrowing is applied before rows are built, so a 32-channel CrIS
+    request costs roughly 32/431 of the above. A finite archived value is
+    not a QC decision: historical files may retain passive or degraded
+    channels even when the aggregate carries no usable quality flag.
+    Training pipelines should apply an explicit platform/channel validity
+    policy.
 
     Note
     ----
@@ -496,7 +730,7 @@ class NNJAObsSat:
     - https://github.com/NOAA-EMC/GSI/blob/860d13740352004fca0136a8c3d0ac9dea30e0da/src/gsi/radinfo.f90#L1523-L1643
     - https://github.com/NOAA-EMC/satingest/blob/3bb883d931d2cbdbd8c5871c30ac25941918c882/ush/ingest_script_atovs1b.sh#L188-L231
     - https://github.com/NOAA-EMC/satingest/blob/3bb883d931d2cbdbd8c5871c30ac25941918c882/sorc/bufr_tranamsua.fd/tranamsua.f#L887-L910
-    - https://www.star.nesdis.noaa.gov/jpss/documents/ATBD/D0001-M01-S01-001_JPSS_ATBD_ATMS-SDR_B.pdf
+    - https://www.star.nesdis.noaa.gov/jpss/documents/ATBD/D0001-M01-S01-001_JPSS_ATBD_ATMS_SDR_D.pdf
     - https://user.eumetsat.int/s3/ope-eup-strapi-media/ATOVS_Level_1b_Product_Guide_f89971ac20.pdf
     - https://www.ncei.noaa.gov/pub/data/cdo/documentation/podguides/N-15%20thru%20N-19/pdf/APPENDIX%20J%20Instrument%20Scan%20Properties.pdf
 
@@ -521,6 +755,7 @@ class NNJAObsSat:
         async_workers: int = 8,
         decode_workers: int = 8,
         retries: int = 3,
+        sensor_indices: dict[str, Sequence[int]] | None = None,
     ) -> None:
         if satellites is None:
             self._satellites: tuple[str, ...] | None = None
@@ -532,6 +767,41 @@ class NNJAObsSat:
                     f"Valid options: {sorted(self.VALID_SATELLITES)}"
                 )
             self._satellites = tuple(sorted(set(satellites)))
+
+        if sensor_indices is None:
+            self._sensor_indices: dict[str, frozenset[int]] = {}
+        else:
+            invalid_sensors = set(sensor_indices) - _NNJA_IR_SENSORS
+            if invalid_sensors:
+                raise ValueError(
+                    f"sensor_indices only applies to the IR sounders "
+                    f"{sorted(_NNJA_IR_SENSORS)}; got {sorted(invalid_sensors)}"
+                )
+            self._sensor_indices = {}
+            for sensor, channels in sensor_indices.items():
+                requested = tuple(channels)
+                if not requested:
+                    raise ValueError(
+                        f"sensor_indices[{sensor!r}] must contain at least "
+                        f"one channel number; omit the sensor to read all "
+                        f"archived channels"
+                    )
+                channel_max = _NNJA_IR_CHANNEL_MAX[sensor]
+                if any(
+                    isinstance(c, bool)
+                    or not isinstance(c, (int, np.integer))
+                    or c < 1
+                    or c > channel_max
+                    for c in requested
+                ):
+                    raise ValueError(
+                        f"sensor_indices[{sensor!r}] must be integer channel "
+                        f"numbers from 1 to {channel_max}"
+                    )
+                normalized = frozenset(int(c) for c in requested)
+                if len(normalized) != len(requested):
+                    raise ValueError(f"sensor_indices[{sensor!r}] must be unique")
+                self._sensor_indices[sensor] = normalized
 
         self._verbose = verbose
         self._cache = cache
@@ -603,7 +873,9 @@ class NNJAObsSat:
                 uri,
                 retries=self._retries,
                 backoff=1.0,
-                task_timeout=120.0,
+                # Hyperspectral IR aggregates (mtiasi, cris) are much larger
+                # than the microwave cycle files; allow 300s per attempt
+                task_timeout=300.0,
                 exceptions=(OSError, IOError, TimeoutError, ConnectionError),
             )
             for uri in uris
@@ -624,6 +896,8 @@ class NNJAObsSat:
                 key,
                 self.cache,
                 cache_key=hashlib.sha256(path.encode()).hexdigest(),
+                chunked=True,
+                atomic=True,
             )
         except FileNotFoundError:
             self._handle_missing_file(path)
@@ -659,8 +933,12 @@ class NNJAObsSat:
         raise _NNJAObsSatIncompleteError("task_failure", **context) from cause
 
     def _handle_missing_file(self, path: str) -> None:
-        """Fail a request when an aggregate cycle file is absent."""
-        raise _NNJAObsSatIncompleteError("remote_file_missing", uri=path)
+        """Warn and skip an absent aggregate cycle file.
+
+        Archive gaps are expected (instrument outages, retired platforms), so one
+        missing cycle should not fail a multi-cycle request.
+        """
+        logger.warning(f"NNJA file {path} not found, skipping")
 
     def local_path(self, uri: str) -> str:
         """Return the deterministic cache path for an S3 URI."""
@@ -682,7 +960,7 @@ class NNJAObsSat:
     ) -> list[_NNJASatTask]:
         variables_by_sensor: dict[str, dict[str, str]] = {}
         for variable_name in variable:
-            source_key, _modifier = self.LEXICON[variable_name]
+            source_key, _modifier = self.LEXICON.get_item(variable_name)
             sensor, separator, source_field = source_key.partition("::")
             if not separator or sensor not in _NNJA_SAT_PRODUCTS or not source_field:
                 raise ValueError(f"Invalid NNJA satellite lexicon key: {source_key}")
@@ -692,8 +970,24 @@ class NNJAObsSat:
         tasks: list[_NNJASatTask] = []
         for sensor, var_plan in variables_by_sensor.items():
             product = _NNJA_SAT_PRODUCTS[sensor]
+            if (
+                sensor in _NNJA_IR_SENSORS
+                and self._satellites is not None
+                and not set(self._satellites) & _NNJA_IR_SATELLITES[sensor]
+            ):
+                # The user's platform filter excludes every satellite carrying
+                # this sensor; skip planning so the multi-GB aggregate is not
+                # fetched and decoded just to filter out every footprint
+                logger.warning(
+                    f"NNJAObsSat: satellites={self._satellites} exclude all "
+                    f"{sensor} platforms {sorted(_NNJA_IR_SATELLITES[sensor])}; "
+                    f"no {sensor} rows will be returned"
+                )
+                continue
             for cycle, (datetime_min, datetime_max) in sorted(windows.items()):
-                if cycle.year < product.first_year:
+                if cycle.year < product.first_year or (
+                    product.last_year is not None and cycle.year > product.last_year
+                ):
                     uri = self._build_satellite_uri(cycle, sensor)
                     raise _NNJAObsSatIncompleteError(
                         "archive_unavailable",
@@ -701,6 +995,7 @@ class NNJAObsSat:
                         sensor=sensor,
                         cycle=cycle.isoformat(),
                         first_year=product.first_year,
+                        last_year=product.last_year,
                     )
                 tasks.append(
                     _NNJASatTask(
@@ -716,24 +1011,41 @@ class NNJAObsSat:
 
     @staticmethod
     def _build_satellite_uri(cycle: datetime, sensor: str) -> str:
-        """Build the NNJA S3 URI for one aggregate microwave cycle."""
+        """Build the NNJA S3 URI for one aggregate satellite cycle file."""
         product = _NNJA_SAT_PRODUCTS[sensor]
-        return (
-            f"s3://{NNJA_BUCKET}/{NNJA_PREFIX}/{product.prefix}/"
-            f"{cycle:%Y/%m}/bufr/gdas.{cycle:%Y%m%d}.t{cycle:%H}z."
-            f"{product.filename}.tm00.bufr_d"
-        )
+        base = f"s3://{NNJA_BUCKET}/{NNJA_PREFIX}/{product.prefix}/{cycle:%Y/%m}/bufr/"
+        if product.naming == "nasa":
+            return f"{base}{product.filename}.{cycle:%Y%m%d}.t{cycle:%H}z.bufr"
+        return f"{base}gdas.{cycle:%Y%m%d}.t{cycle:%H}z.{product.filename}.tm00.bufr_d"
 
     def _decode_file(self, local_path: str, task: _NNJASatTask) -> pd.DataFrame:
-        frame = decode_microwave(
-            local_path,
-            task.sensor,
-            task.var_plan,
-            task.datetime_min,
-            task.datetime_max,
-            self._satellites,
-            decode_workers=self._decode_workers,
-        )
+        if task.sensor in _NNJA_IR_SENSORS:
+            sensor_sats = _NNJA_IR_SATELLITES[task.sensor]
+            sat_filter = (
+                tuple(s for s in self._satellites if s in sensor_sats)
+                if self._satellites is not None
+                else None
+            )
+            frame = decode_ir_sounder(
+                local_path,
+                task.sensor,
+                # Every archived channel unless narrowed via sensor_indices
+                self._sensor_indices.get(task.sensor),
+                task.datetime_min,
+                task.datetime_max,
+                sat_filter,
+                decode_workers=self._decode_workers,
+            )
+        else:
+            frame = decode_microwave(
+                local_path,
+                task.sensor,
+                task.var_plan,
+                task.datetime_min,
+                task.datetime_max,
+                self._satellites,
+                decode_workers=self._decode_workers,
+            )
         return frame[self.SCHEMA.names]
 
     @classmethod

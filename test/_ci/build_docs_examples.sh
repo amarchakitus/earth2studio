@@ -15,49 +15,51 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set -euo pipefail
+set -Eeuo pipefail
 
-docs_jobs="${DOCS_JOBS:-4}"
-uv_python="${UV_PYTHON:-3.13.13}"
+docs_jobs="${DOCS_JOBS:-1}"
+uv_docs=(uv run --locked --group docs)
+log_dir="${DOCS_EXAMPLE_LOG_DIR:-docs/_build/example-logs}"
+main_log="${log_dir}/docs-examples.log"
+requested_section="${1:-}"
 
-uv sync --python "${uv_python}" --locked --extra all --group docs
+if [ "$#" -gt 1 ]; then
+    echo "Usage: $0 [SECTION]" >&2
+    exit 2
+fi
+if [ -n "${requested_section}" ]; then
+    if [[ ! "${requested_section}" =~ ^[0-9][0-9]_[A-Za-z0-9_-]+$ ]]; then
+        echo "Invalid example section: ${requested_section}" >&2
+        exit 2
+    fi
+    if [ ! -d "examples/${requested_section}" ]; then
+        echo "Example section does not exist: ${requested_section}" >&2
+        exit 2
+    fi
+fi
 
-# Start from a clean docs tree once, then preserve generated outputs while each
-# example is built with its own Sphinx Gallery filename pattern.
-rm -rf docs/examples
-rm -rf docs/modules/generated
-rm -rf docs/modules/backreferences
-rm -rf examples/outputs
+mkdir -p "${log_dir}"
+exec > >(tee -a "${main_log}") 2>&1
 
-uv run make -C docs clean
-uv run make -C docs html
+echo "Example execution log: ${main_log}"
 
-mapfile -t sections < <(
-    find examples -mindepth 1 -maxdepth 1 -type d -name "[0-9]*" | sort
-)
+# Rebuild examples from source, section by section, so stale examples are refreshed.
+rm -rf docs/examples examples/outputs
+
+if [ -n "${requested_section}" ]; then
+    sections=("examples/${requested_section}")
+else
+    mapfile -t sections < <(
+        find examples -mindepth 1 -maxdepth 1 -type d -name "[0-9]*" | sort
+    )
+fi
 
 for section in "${sections[@]}"; do
-    mapfile -t examples < <(
-        find "${section}" -maxdepth 1 -type f -name "[0-9]*.py" | sort
-    )
-
-    if [ "${#examples[@]}" -eq 0 ]; then
-        continue
+    selector="${section#examples/}"
+    echo "::group::Build docs examples: ${selector}"
+    if ! "${uv_docs[@]}" e2s-gallery build "${selector}" --execute stale --jobs "${docs_jobs}"; then
+        echo "::endgroup::"
+        exit 1
     fi
-
-    echo "::group::Build docs examples: ${section}"
-    for example in "${examples[@]}"; do
-        relative_example="${example#examples/}"
-        filename_pattern="/${relative_example//./\\.}$"
-
-        echo "Building docs example: ${example}"
-        PLOT_GALLERY=True \
-            RUN_STALE_EXAMPLES=True \
-            FILENAME_PATTERN="${filename_pattern}" \
-            uv run make -j "${docs_jobs}" -C docs html
-    done
     echo "::endgroup::"
 done
-
-# Refresh the final HTML without cleaning or re-running examples.
-uv run make -C docs html

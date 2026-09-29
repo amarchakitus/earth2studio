@@ -15,11 +15,12 @@
 # limitations under the License.
 
 from .ace2 import ACE2ERA5Data
-from .arco import ARCO
+from .arco import ARCO, ARCO_ERA5
 from .base import DataSource, ForecastSource
 from .cams import CAMS_FX
+from .camulator import CAMulatorForcing
 from .cbottle import CBottle3D
-from .cds import CDS
+from .cds import CDS, CDS_ERA5
 from .cfs import CFS_FX, CFS_FX_Flux
 from .cfs_reforecast import CFS_Reforecast_FX, CFS_Reforecast_FX_Flux
 from .cmip6 import CMIP6, CMIP6MultiRealm
@@ -61,6 +62,7 @@ from .jpss import JPSS
 from .jpss_atms import JPSS_ATMS
 from .jpss_cris import JPSS_CRIS
 from .meteosat_fci import MeteosatFCI
+from .meteosat_li import MeteosatLI
 from .metop_amsua import MetOpAMSUA
 from .metop_avhrr import MetOpAVHRR
 from .metop_iasi import MetOpIASI
@@ -68,7 +70,7 @@ from .metop_mhs import MetOpMHS
 from .mrms import MRMS
 from .ncar import NCAR_ERA5
 from .nclimgrid import NClimGridDaily
-from .nnja import NNJAObsConv, NNJAObsSat
+from .nnja import NNJAObsConv, NNJAObsSat, NNJAObsSatwnd
 from .opera import OPERA
 from .planetary_computer import (
     PlanetaryComputerECMWFOpenDataIFS,
@@ -79,6 +81,7 @@ from .planetary_computer import (
 )
 from .rand import Random, Random_FX, RandomDataFrame
 from .rx import CosineSolarZenith, LandSeaMask, SurfaceGeoPotential
+from .samudrace import SamudrACEData, SamudrACEForcingData
 from .time_window import TimeWindow
 from .ufs import UFSObsConv, UFSObsSat
 from .utils import datasource_to_file, fetch_data, fetch_dataframe, prep_data_array
